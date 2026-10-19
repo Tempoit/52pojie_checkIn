@@ -23,8 +23,22 @@ import http.client
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
-import notify
 import waf_solver
+
+# 复用恩山论坛（ZaiZaiCat-Checkin）的统一通知通道，保持推送方式与模板一致
+_ZAIZAI_NOTIFY_DIR = "/ql/data/scripts/ZaiZaiCat-Checkin"
+if os.path.isdir(_ZAIZAI_NOTIFY_DIR) and _ZAIZAI_NOTIFY_DIR not in sys.path:
+    sys.path.insert(0, _ZAIZAI_NOTIFY_DIR)
+try:
+    from notification import send_notification, NotificationSound
+    _ZAIZAI_NOTIFY = True
+except Exception as _e:  # 本地/非青龙环境下退回到自带 notify
+    send_notification = None
+    NotificationSound = None
+    _ZAIZAI_NOTIFY = False
+    _ZAIZAI_NOTIFY_ERR = str(_e)
+
+import notify
 
 # 日志格式化配置
 logging.basicConfig(
@@ -404,39 +418,69 @@ def check_in_account(account_index: int, cookie_str: str) -> Dict[str, str]:
         return {"index": str(account_index), "user": username, "status": "失败", "msg": f"异常: {e}"}
 
 
-def build_report_text(results_list: List[Dict[str, str]], time_str: str, mask: bool = False) -> str:
-    """生成格式化签到汇报卡片文本，支持公开日志脱敏."""
-    report_lines = [
-        "🔔【52Pojie 每日签到】",
-        "━━━━━━━━━━━━━━━"
-    ]
-    for idx, r in enumerate(results_list):
-        if idx > 0:
-            report_lines.append("───────────────")
-        user_group = r.get('group', '未知')
-        if user_group == '未知':
-            user_group = '会员'
+def build_report_text(results_list: List[Dict[str, str]], time_str: str,
+                      mask: bool = False, duration: int = 0) -> str:
+    """生成与恩山论坛签到一致风格的汇报卡片，支持公开日志脱敏."""
+    total = len(results_list)
+    ok_count = sum(1 for r in results_list if r.get("status") == "成功")
+    fail_count = total - ok_count
 
-        if r["status"] == "成功":
-            if "已签到" in r["msg"] or "已打卡" in r["msg"]:
-                status_text = "已签到 ✅"
+    lines = ["📊 执行统计:"]
+    if ok_count > 0:
+        lines.append(f"✅ 成功: {ok_count} 个账号")
+    if fail_count > 0:
+        lines.append(f"❌ 失败: {fail_count} 个账号")
+    lines.append(f"📈 总计: {total} 个账号")
+    lines.append("")
+    lines.append("📝 详情:")
+
+    for r in results_list:
+        display_user = mask_username(r.get("user", "未知账号")) if mask else r.get("user", "未知账号")
+        group = r.get("group") or "未知"
+        if group == "未知":
+            group = "会员"
+
+        if r.get("status") == "成功":
+            if "已签到" in r.get("msg", "") or "已打卡" in r.get("msg", ""):
+                msg = "今日已签到"
             else:
-                status_text = "签到成功 ✅"
+                msg = "签到成功"
+            cb = r.get("cb") or "未知"
+            credit = r.get("credit") or "未知"
+            if cb != "未知":
+                msg = f"{msg}，吾爱币 {cb}"
+            if credit != "未知":
+                msg += f"｜积分 {credit}"
+            lines.append(f"  ✅ [{display_user}·{group}] {msg}")
         else:
-            status_text = f"签到失败 ❌ ({r['msg']})"
+            err = str(r.get("msg", "未知错误"))
+            if len(err) > 50:
+                err = err[:50] + "..."
+            lines.append(f"  ❌ [{display_user}·{group}] {err}")
 
-        display_user = mask_username(r['user']) if mask else r['user']
-        report_lines.append(f"👤 账号：{display_user}【{user_group}】")
-        report_lines.append(f"🎉 状态：{status_text}")
-        report_lines.append(f"💰 吾爱币：{r.get('cb', '未知')}")
+    lines.append("")
+    if duration > 0:
+        lines.append(f"⏱️ 执行耗时: {int(duration)}秒")
+    lines.append(f"🕐 完成时间: {time_str}")
+    return "\n".join(lines)
 
-    report_lines.append("───────────────")
-    report_lines.append(f"⏰ 时间：{time_str}")
-    report_lines.append("━━━━━━━━━━━━━━━")
-    return "\n".join(report_lines)
+
+def build_title(results_list: List[Dict[str, str]]) -> str:
+    """根据结果生成通知标题（成功/失败/部分成功）。"""
+    total = len(results_list)
+    ok_count = sum(1 for r in results_list if r.get("status") == "成功")
+    fail_count = total - ok_count
+    if total == 0:
+        return "吾爱破解签到异常 ❌"
+    if fail_count == 0:
+        return "吾爱破解签到成功 ✅"
+    if ok_count == 0:
+        return "吾爱破解签到失败 ❌"
+    return "吾爱破解签到部分成功 ⚠️"
 
 
 def main():
+    _start_time = datetime.now()
     logger.info("==========================================")
     logger.info("   吾爱破解（52pojie）自动签到任务启动   ")
     logger.info("==========================================")
@@ -487,15 +531,36 @@ def main():
     tz_beijing = timezone(timedelta(hours=8))
     beijing_time = datetime.now(tz_beijing).strftime("%Y-%m-%d %H:%M:%S")
 
+    # 计算耗时
+    _duration = int((datetime.now() - _start_time).total_seconds())
+
     # 生成私有推送内容（真实账号）与公开展示内容（脱敏账号）
-    private_summary = build_report_text(results, beijing_time, mask=False)
-    public_summary = build_report_text(results, beijing_time, mask=True)
+    private_summary = build_report_text(results, beijing_time, mask=False, duration=_duration)
+    public_summary = build_report_text(results, beijing_time, mask=True, duration=_duration)
 
     # 控制台日志仅输出脱敏版本，彻底杜绝开源后云端控制台泄露账号
     logger.info("\n" + public_summary)
 
-    # 发送推送（私密通道推送 private_summary，公开 Actions Summary 写入 public_summary）
-    notify.send("52Pojie 每日签到", private_summary, public_content=public_summary)
+    # 通知标题与提示音（与恩山签到保持一致的分级方式）
+    title = build_title(results)
+    if title.endswith("✅"):
+        sound = NotificationSound.BIRDSONG if _ZAIZAI_NOTIFY else None
+    elif title.endswith("⚠️"):
+        sound = NotificationSound.BELL if _ZAIZAI_NOTIFY else None
+    else:
+        sound = NotificationSound.ALARM if _ZAIZAI_NOTIFY else None
+
+    if _ZAIZAI_NOTIFY:
+        # 走恩山同一条推送通道（企业微信应用消息等）
+        try:
+            send_notification(title=title, content=private_summary, sound=sound)
+            logger.info("✅ 吾爱破解签到推送已通过恩山通知通道发送")
+        except Exception as e:
+            logger.error(f"❌ 恩山通知通道发送失败: {e}")
+            notify.send(title, private_summary, public_content=public_summary)
+    else:
+        logger.warning("未找到恩山通知模块(%s)，使用脚本自带推送", _ZAIZAI_NOTIFY_ERR)
+        notify.send(title, private_summary, public_content=public_summary)
 
     logger.info("所有签到流程处理完毕。")
 
