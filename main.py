@@ -5,6 +5,7 @@
 """
 
 import os
+import json
 import re
 import sys
 import time
@@ -39,6 +40,114 @@ except Exception as _e:  # 本地/非青龙环境下退回到自带 notify
     _ZAIZAI_NOTIFY_ERR = str(_e)
 
 import notify
+
+# ============================================================
+# 企业微信专属缩略图管理（用于 52pojie 签到通知卡片）
+# 临时素材 3 天过期，故本地缓存 media_id 并到期自动续传
+# ============================================================
+_QYWX_CFG_PATH = "/ql/data/scripts/ZaiZaiCat-Checkin/config/notification.json"
+_MEDIA_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".qywx_media.json")
+_MEDIA_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "52pojie_thumb.jpg")
+_MEDIA_TTL = 2 * 24 * 3600  # 保守起见 2 天续传（官方 3 天）
+
+
+def _load_qywx_cfg():
+    try:
+        with open(_QYWX_CFG_PATH, encoding="utf-8") as f:
+            return json.load(f).get("qywx", {})
+    except Exception as e:
+        logger.warning(f"读取企业微信配置失败: {e}")
+        return None
+
+
+def _get_media_id():
+    """返回 52pojie 专属缩略图的 media_id；失效则自动重新上传。失败返回 None。"""
+    cfg = _load_qywx_cfg()
+    if not cfg:
+        return None
+    if not os.path.exists(_MEDIA_IMAGE):
+        logger.debug("未找到缩略图文件，使用默认样式")
+        return None
+
+    # 读缓存
+    cache = {}
+    if os.path.exists(_MEDIA_CACHE_PATH):
+        try:
+            with open(_MEDIA_CACHE_PATH, encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    now = int(time.time())
+    if cache.get("media_id") and now - int(cache.get("ts", 0)) < _MEDIA_TTL:
+        return cache["media_id"]
+
+    # 重新上传
+    origin = cfg.get("origin", "https://qyapi.weixin.qq.com").rstrip("/")
+    try:
+        tr = requests.get(
+            f"{origin}/cgi-bin/gettoken?corpid={cfg['corpid']}&corpsecret={cfg['corpsecret']}",
+            timeout=20,
+        ).json()
+        token = tr.get("access_token")
+        if not token:
+            logger.warning(f"获取企业微信 token 失败: {tr.get('errmsg')}")
+            return cache.get("media_id")  # 回退到旧值
+        with open(_MEDIA_IMAGE, "rb") as f:
+            up = requests.post(
+                f"{origin}/cgi-bin/media/upload?access_token={token}&type=image",
+                files={"media": ("52pojie_thumb.jpg", f, "image/jpeg")},
+                timeout=30,
+            ).json()
+        if up.get("errcode") == 0:
+            with open(_MEDIA_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"media_id": up["media_id"], "ts": now}, f)
+            logger.info("已更新 52pojie 通知缩略图素材")
+            return up["media_id"]
+        logger.warning(f"上传缩略图失败: {up.get('errmsg')}")
+    except Exception as e:
+        logger.warning(f"上传缩略图异常: {e}")
+    return cache.get("media_id")
+
+
+def _send_qywx_mpnews(title: str, content: str) -> bool:
+    """用 52pojie 专属缩略图发送企业微信应用消息。失败返回 False。"""
+    cfg = _load_qywx_cfg()
+    if not cfg:
+        return False
+    media_id = _get_media_id()
+    if not media_id:
+        return False
+    origin = cfg.get("origin", "https://qyapi.weixin.qq.com").rstrip("/")
+    try:
+        token = requests.get(
+            f"{origin}/cgi-bin/gettoken?corpid={cfg['corpid']}&corpsecret={cfg['corpsecret']}",
+            timeout=20,
+        ).json().get("access_token")
+        if not token:
+            return False
+        data = {
+            "touser": cfg["touser"],
+            "msgtype": "mpnews",
+            "agentid": cfg["agentid"],
+            "mpnews": {"articles": [{
+                "title": title,
+                "thumb_media_id": media_id,
+                "content": content.replace("\n", "<br>"),
+                "digest": content,
+            }]},
+        }
+        r = requests.post(
+            f"{origin}/cgi-bin/message/send?access_token={token}",
+            json=data, timeout=20,
+        ).json()
+        if r.get("errcode") == 0:
+            logger.info("✅ 企业微信应用消息推送成功（52pojie 专属缩略图）")
+            return True
+        logger.warning(f"企业微信推送失败: {r.get('errmsg')}")
+    except Exception as e:
+        logger.warning(f"企业微信推送异常: {e}")
+    return False
 
 # 日志格式化配置
 logging.basicConfig(
@@ -550,7 +659,10 @@ def main():
     else:
         sound = NotificationSound.ALARM if _ZAIZAI_NOTIFY else None
 
-    if _ZAIZAI_NOTIFY:
+    # 优先用 52pojie 专属缩略图走企业微信；失败再回退到恩山通道
+    if _send_qywx_mpnews(title, private_summary):
+        pass
+    elif _ZAIZAI_NOTIFY:
         # 走恩山同一条推送通道（企业微信应用消息等）
         try:
             send_notification(title=title, content=private_summary, sound=sound)
